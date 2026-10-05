@@ -1,14 +1,14 @@
 <script setup lang="ts">
 import { computed, nextTick, reactive, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
-import { flushProject, getProject, getRule, persistProject, store } from '../logic/store'
-import { analyzeDraft, findDuplicateIds, makePersonId, type PersonDraft } from '../logic/analyze'
+import { ensureMerged, flushProject, getProject, getRule, persistProject, store } from '../logic/store'
+import { analyzeDraft, findDuplicateIds, makePersonId, specialFlagCautions, type PersonDraft } from '../logic/analyze'
 import { estimateInitialSize, type EstimateResult } from '../logic/estimate'
 import { formatCm, parseLengthCm, parseWeightKg } from '../logic/precision'
+import { specialFlagLabel } from '../logic/sizeRules'
 import { downloadText, toCsvText } from '../logic/csv'
-import { runMerge } from '../logic/merge'
 import { detailRows } from '../logic/exporter'
-import type { Gender, Person } from '../logic/types'
+import type { Gender, Person, Project } from '../logic/types'
 
 const route = useRoute()
 const project = computed(() => getProject(route.params.id as string))
@@ -35,6 +35,16 @@ const notice = ref('')
 const warnText = ref('')
 const savedCount = ref(0)
 const saving = ref(false)
+
+/** 正在修改的行 id；null 表示连续录入模式（保存即新增） */
+const editingId = ref<string | null>(null)
+const editingPerson = computed<Person | null>(
+  () => project.value?.persons.find((person) => person.id === editingId.value) ?? null
+)
+const editingIndex = computed(() => {
+  if (!project.value || !editingId.value) return -1
+  return project.value.persons.findIndex((person) => person.id === editingId.value)
+})
 
 watch(
   project,
@@ -66,7 +76,7 @@ const duplicateIds = computed(() => {
       sourceRow: null,
       source: 'manual'
     },
-    undefined
+    editingId.value ?? undefined
   )
 })
 
@@ -126,6 +136,15 @@ async function save(): Promise<void> {
     return
   }
   saving.value = true
+  if (editingId.value) saveEdit(current)
+  else saveNew(current)
+  saving.value = false
+  await nextTick()
+  heightRef.value?.focus()
+}
+
+/** 连续录入：新增一行 */
+function saveNew(current: Project): void {
   const draft: PersonDraft = {
     name: form.name,
     gender: form.gender,
@@ -170,8 +189,8 @@ async function save(): Promise<void> {
   sticky.batch = person.batch
   savedCount.value += 1
   resetForm()
+  ensureMerged(current)
   persistProject(current, true)
-  saving.value = false
   notice.value = `第 ${current.persons.length} 条（${person.name}）已保存到本机 IndexedDB，断网也不丢`
   if (outcome.status === 'invalid') {
     warnText.value = `已拦截：${outcome.statusReason}；该行记为无效行，不计入有效人数，可在归并页复核`
@@ -180,14 +199,150 @@ async function save(): Promise<void> {
   } else if (duplicated.length > 0) {
     warnText.value = `可能与「${duplicated[0]}」重复（同名 + 同班级 + 同身高体重），已保留并标记，未自动删除`
   }
-  await nextTick()
-  heightRef.value?.focus()
+}
+
+/** 修改模式：写回本条自己，不新增行；号型按项目锁定的规则版本重新判定 */
+function saveEdit(current: Project): void {
+  const person = editingPerson.value
+  if (!person) {
+    editingId.value = null
+    warnText.value = '该行已不存在（可能刚被删除），修改未保存'
+    return
+  }
+  const previousGender = person.gender
+  const previousOverride = person.result?.manualOverride ? { ...person.result.manualOverride } : null
+  const draft: PersonDraft = {
+    name: form.name,
+    gender: form.gender,
+    orgUnit: form.orgUnit,
+    batch: form.batch || current.batches[0] || '未分批',
+    heightCm: parseLengthCm(form.heightCm),
+    weightKg: parseWeightKg(form.weightKg),
+    chestCm: parseLengthCm(form.chestCm),
+    waistCm: parseLengthCm(form.waistCm),
+    specialFlag: form.specialFlag || null,
+    note: form.note,
+    sourceRow: person.sourceRow,
+    source: person.source
+  }
+  const outcome = analyzeDraft(draft, rule.value)
+  const duplicated = findDuplicateIds(current.persons, draft, person.id)
+  person.name = draft.name.trim()
+  person.gender = draft.gender ?? 'male'
+  person.orgUnit = draft.orgUnit.trim()
+  person.batch = draft.batch
+  person.heightCm = draft.heightCm ?? 0
+  person.weightKg = draft.weightKg
+  person.chestCm = draft.chestCm ?? 0
+  person.waistCm = draft.waistCm ?? 0
+  person.specialFlag = draft.specialFlag
+  person.note = draft.note
+  // 「重复并排除」是人工判定，不随数值修改自动恢复；其余状态按新数据重新校验
+  if (person.status !== 'duplicate') {
+    person.status = outcome.status
+    person.statusReason = outcome.statusReason
+  }
+  person.anomaly = outcome.anomaly
+  person.needsConfirm = outcome.needsConfirm || duplicated.length > 0
+  person.possibleDuplicateOf = duplicated.length > 0 ? `既有行「${duplicated[0]}」` : null
+  // 重新归并：runMerge 会按新数据重算 ruleSizeCode，并原样保留人工覆写
+  ensureMerged(current)
+  persistProject(current, true)
+
+  const rowNo = current.persons.indexOf(person) + 1
+  const notes: string[] = [`已写回第 ${rowNo} 条（${person.name}），未新增行`]
+  const warns: string[] = []
+  if (person.status === 'active') {
+    if (person.result) {
+      notes.push(
+        person.specialFlag
+          ? `号型已按规则版本 ${rule.value.version} 重新判定为 ${person.result.ruleSizeCode || person.result.sizeCode}（特殊体型单列，不进常规档）`
+          : `号型已按规则版本 ${rule.value.version} 重新判定为 ${person.result.ruleSizeCode || person.result.sizeCode}`
+      )
+    } else {
+      warns.push('修改后的数据按当前规则无法判定号型（胸腰差不在型别区间），请到归并页人工处理')
+    }
+  }
+  // 人工覆写保留与差异提示
+  const override = person.result?.manualOverride ?? null
+  if (override) {
+    const ruleCode = person.result?.ruleSizeCode ?? ''
+    if (ruleCode && ruleCode !== override.sizeCode) {
+      warns.push(
+        `该条已有人工覆写 ${override.sizeCode}（${override.by}：${override.reason}），已保留并继续生效；` +
+          `按修改后数据重新判定为 ${ruleCode}，两者不一致。如需采用新判定结果，请到归并页撤销覆写`
+      )
+    } else if (ruleCode) {
+      notes.push(`人工覆写 ${override.sizeCode} 与重新判定结果一致，继续生效`)
+    } else {
+      warns.push(`该条已有人工覆写 ${override.sizeCode}，已保留并继续生效；修改后的数据按规则无法判定号型`)
+    }
+  } else if (previousOverride && person.status !== 'active') {
+    warns.push(
+      `该行现为${person.status === 'invalid' ? '无效行' : '重复排除行'}，原人工覆写 ${previousOverride.sizeCode} 暂不生效；恢复有效后如需保留请在归并页重新覆写`
+    )
+  }
+  // 特殊体型标记在新数据下是否仍然合适（只提示，不自动取消）
+  warns.push(...specialFlagCautions(rule.value, person, previousGender))
+  if (outcome.status === 'invalid' && person.status === 'invalid') {
+    warns.push(`已拦截：${outcome.statusReason}；该行记为无效行，不计入有效人数，可在归并页复核`)
+  } else if (person.status === 'duplicate') {
+    warns.push('该行仍是「重复并排除」状态，不计入有效人数；如修改后不再是重复行，请到归并页恢复计入')
+  } else if (outcome.messages.length > 0) {
+    warns.push(...outcome.messages)
+  }
+  if (duplicated.length > 0) {
+    warns.push(`可能与「${duplicated[0]}」重复（同名 + 同班级 + 同身高体重），已保留并标记，未自动删除`)
+  }
+  editingId.value = null
+  resetForm()
+  notice.value = notes.join('；')
+  warnText.value = warns.join('；')
+}
+
+/** 点击「改」：把这一行填回录入表单，进入修改模式 */
+function startEdit(person: Person): void {
+  editingId.value = person.id
+  form.name = person.name
+  form.gender = person.gender
+  form.orgUnit = person.orgUnit
+  form.batch = person.batch
+  form.heightCm = person.heightCm > 0 ? formatCm(person.heightCm) : ''
+  form.weightKg = person.weightKg === null ? '' : String(person.weightKg)
+  form.chestCm = person.chestCm > 0 ? formatCm(person.chestCm) : ''
+  form.waistCm = person.waistCm > 0 ? formatCm(person.waistCm) : ''
+  form.specialFlag = person.specialFlag ?? ''
+  form.note = person.note
+  notice.value = ''
+  warnText.value = ''
+  void nextTick(() => {
+    formRef.value?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    heightRef.value?.focus()
+  })
+}
+
+/** 放弃修改，回到连续录入模式（班级 / 性别 / 批次恢复为沿用上一条） */
+function cancelEdit(): void {
+  editingId.value = null
+  resetForm()
+  notice.value = ''
+  warnText.value = ''
+}
+
+/** 来源标识：手录 / 导入（导入文件里的行号） */
+function sourceText(person: Person): string {
+  if (person.source === 'import') {
+    return person.sourceRow !== null ? `导入·第 ${person.sourceRow} 行` : '导入'
+  }
+  return '手录'
 }
 
 async function removePerson(person: Person): Promise<void> {
   const current = project.value
   if (!current) return
+  if (editingId.value === person.id) cancelEdit()
   current.persons = current.persons.filter((item) => item.id !== person.id)
+  ensureMerged(current)
   persistProject(current, true)
   notice.value = `已删除「${person.name}」`
 }
@@ -195,7 +350,7 @@ async function removePerson(person: Person): Promise<void> {
 async function exportFallbackCsv(): Promise<void> {
   const current = project.value
   if (!current) return
-  runMerge(current, rule.value)
+  ensureMerged(current)
   await flushProject(current)
   const rows = detailRows({ project: current, rule: rule.value })
   downloadText(
@@ -232,11 +387,15 @@ function genderText(gender: Gender): string {
       </div>
     </div>
 
-    <div class="card">
+    <div class="card" :class="editingPerson ? 'card-accent-warn' : ''">
       <div class="card-head">
-        <h2>连续录入（回车即存下一条）</h2>
+        <h2 v-if="editingPerson">
+          正在修改：第 {{ editingIndex + 1 }} 条「{{ editingPerson.name }}」（{{ sourceText(editingPerson) }}）
+        </h2>
+        <h2 v-else>连续录入（回车即存下一条）</h2>
         <div class="spacer"></div>
-        <span class="hint">光标自动回到身高；同班级数据只需改动身高体重胸腰围</span>
+        <span v-if="editingPerson" class="badge badge-warn">修改模式：保存写回本条，不新增行</span>
+        <span v-else class="hint">光标自动回到身高；同班级数据只需改动身高体重胸腰围</span>
       </div>
       <div class="card-body">
         <form ref="formRef" @submit.prevent="save" @keydown.enter="onEnter">
@@ -351,11 +510,20 @@ function genderText(gender: Gender): string {
           </div>
 
           <div class="toolbar" style="margin-top: 12px">
-            <button class="btn btn-primary btn-accent" type="submit">保存并录入下一条（回车）</button>
-            <button class="btn" type="button" @click="focusHeight">回到身高</button>
+            <button class="btn btn-primary btn-accent" type="submit">
+              {{ editingPerson ? '保存修改（写回本条）' : '保存并录入下一条（回车）' }}
+            </button>
+            <button v-if="editingPerson" class="btn" type="button" @click="cancelEdit">取消修改</button>
+            <button v-else class="btn" type="button" @click="focusHeight">回到身高</button>
             <span class="hint">身高 / 胸围 / 腰围按 0.5cm 精度存储与判定</span>
           </div>
         </form>
+
+        <p v-if="editingPerson" class="notice notice-info" style="margin-top: 12px">
+          修改第 {{ editingIndex + 1 }} 条（{{ sourceText(editingPerson) }}）：保存后写回本条自己，不新增行；
+          号型将按规则版本 {{ project.ruleVersion }} 重新判定，已有人工覆写会保留并提示差异，
+          归并页与汇总页的人数、套数随之更新。
+        </p>
 
         <p v-if="notice" class="notice notice-ok" style="margin-top: 12px">{{ notice }}</p>
         <p v-if="warnText" class="notice notice-warn" style="margin-top: 12px">{{ warnText }}</p>
@@ -381,6 +549,9 @@ function genderText(gender: Gender): string {
           <div class="spacer"></div>
           <span class="badge badge-ok">本次会话新增 {{ savedCount }} 条</span>
         </div>
+        <div class="card-body tight" style="padding-bottom: 0">
+          <p class="hint">点「改」把该行填回上方表单，保存后写回本条、不新增行；导入行同样可改，来源列标明「手录 / 导入·第 N 行」。</p>
+        </div>
         <div v-if="recent.length === 0" class="empty">还没有录入数据</div>
         <div v-else class="table-wrap">
           <table class="data-table">
@@ -391,24 +562,50 @@ function genderText(gender: Gender): string {
                 <th class="num">身高</th>
                 <th class="num">胸围</th>
                 <th class="num">腰围</th>
+                <th>号型</th>
+                <th>来源</th>
                 <th>状态</th>
                 <th></th>
               </tr>
             </thead>
             <tbody>
-              <tr v-for="person in recent" :key="person.id" :class="person.status === 'active' ? '' : 'row-invalid'">
+              <tr
+                v-for="person in recent"
+                :key="person.id"
+                :class="[
+                  person.status === 'active' ? '' : 'row-invalid',
+                  editingId === person.id ? 'row-highlight' : ''
+                ]"
+              >
                 <td>{{ person.name }}</td>
                 <td>{{ genderText(person.gender) }}</td>
                 <td class="num">{{ formatCm(person.heightCm) }}</td>
                 <td class="num">{{ formatCm(person.chestCm) }}</td>
                 <td class="num">{{ formatCm(person.waistCm) }}</td>
                 <td>
-                  <span class="badge" :class="person.status === 'active' ? 'badge-ok' : 'badge-danger'">
-                    {{ person.status === 'active' ? '有效' : '无效' }}
+                  <b>{{ person.result?.sizeCode || '—' }}</b>
+                  <span v-if="person.result?.manualOverride" class="badge badge-warn">已覆写</span>
+                </td>
+                <td>
+                  <span class="badge" :class="person.source === 'import' ? 'badge-info' : ''">
+                    {{ sourceText(person) }}
                   </span>
                 </td>
                 <td>
-                  <button class="btn btn-sm btn-danger" type="button" @click="removePerson(person)">删除</button>
+                  <span class="badge" :class="person.status === 'active' ? 'badge-ok' : 'badge-danger'">
+                    {{ person.status === 'active' ? '有效' : person.status === 'invalid' ? '无效' : '重复' }}
+                  </span>
+                  <span v-if="person.specialFlag" class="badge badge-warn">
+                    {{ specialFlagLabel(rule, person.specialFlag) }}
+                  </span>
+                </td>
+                <td>
+                  <div class="toolbar">
+                    <button class="btn btn-sm" type="button" @click="startEdit(person)">
+                      {{ editingId === person.id ? '修改中' : '改' }}
+                    </button>
+                    <button class="btn btn-sm btn-danger" type="button" @click="removePerson(person)">删除</button>
+                  </div>
                 </td>
               </tr>
             </tbody>
@@ -421,6 +618,7 @@ function genderText(gender: Gender): string {
         <div class="card-body tight">
           <p>· 回车即保存并自动聚焦身高，适合一人接一人连续录入。</p>
           <p>· 班级 / 性别 / 批次会沿用上一条，同班录入只需改数值。</p>
+          <p>· 录错了不用删了重录：在最近保存里点「改」，改完写回原行，号型自动重新判定。</p>
           <p>· 身高 80cm、胸围小于身高一半、胸腰差为负等异常会即时提示，并标记为待确认或无效行。</p>
           <p>· 特殊体型（加肥加大 / 特体定制 / 超高定制）请选择标记，将单列进定制清单，不混入常规档。</p>
           <p>· 无网也能录入：数据写入本机 IndexedDB，随时可用「导出 CSV（兜底）」带出。</p>

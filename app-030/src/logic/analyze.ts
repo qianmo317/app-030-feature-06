@@ -3,7 +3,7 @@
  */
 import type { AnomalyCode, Gender, Person, PersonStatus, SizeRule } from './types'
 import { resolveFit } from './sizeRules'
-import { chestWaistDiffCm } from './precision'
+import { chestWaistDiffCm, formatCm } from './precision'
 
 export type PersonDraft = {
   name: string
@@ -144,6 +144,55 @@ export function analyzeDraft(draft: PersonDraft, rule: SizeRule): AnalyzeOutcome
     messages.push('已标记特殊体型，将单列进定制清单，不混入常规档')
   }
   return { status: 'active', statusReason: '', anomaly, needsConfirm, canMerge: true, messages }
+}
+
+/**
+ * 修改已保存行之后，评估「特殊体型标记」在新数据下是否仍然合适。
+ * 只提示、不自动取消（与重复行同一原则）；阈值全部从 SizeRule 派生，不在组件里写死：
+ * - 标记码不在当前规则版本的标记列表中 → 提示复核；
+ * - 性别被改动 → 男女型别区间不同，按原性别评估的标记需复核；
+ * - 「超高」类标记：身高已明显低于可判定范围上限（上限 − 2 个身高档）→ 可能不再合适；
+ * - 「加肥加大」类标记：胸腰差已落回某个型别区间、常规档可覆盖 → 可能不再必要。
+ */
+export function specialFlagCautions(
+  rule: SizeRule,
+  person: { gender: Gender; heightCm: number; chestCm: number; waistCm: number; specialFlag: string | null },
+  previousGender?: Gender | null
+): string[] {
+  const flag = person.specialFlag
+  if (!flag) return []
+  const cautions: string[] = []
+  const meta = rule.specialFlags.find((item) => item.code === flag)
+  const label = meta?.label ?? flag
+  if (!meta) {
+    cautions.push(`特殊标记「${flag}」不在规则版本 ${rule.version} 的标记列表中，请复核`)
+  }
+  if (previousGender && previousGender !== person.gender) {
+    const from = previousGender === 'male' ? '男' : '女'
+    const to = person.gender === 'male' ? '男' : '女'
+    cautions.push(
+      `性别已由${from}改为${to}，「${label}」标记是按原性别评估的；男女型别区间不同，请复核该标记是否仍然合适`
+    )
+  }
+  const key = `${flag} ${meta?.label ?? ''}`
+  if (/超高|TALL/i.test(key) && person.heightCm > 0) {
+    const tallLine = rule.heightRangeCm.maxCm - rule.heightStepCm * 2
+    if (person.heightCm <= tallLine) {
+      cautions.push(
+        `身高 ${formatCm(person.heightCm)}cm 已明显低于可判定上限 ${formatCm(rule.heightRangeCm.maxCm)}cm，「${label}」标记可能不再合适，请确认是否取消`
+      )
+    }
+  }
+  if (/加肥|加大|PLUS/i.test(key) && person.chestCm > 0 && person.waistCm > 0) {
+    const diffCm = chestWaistDiffCm(person.chestCm, person.waistCm)
+    const fit = resolveFit(rule, person.gender, diffCm)
+    if (fit) {
+      cautions.push(
+        `胸腰差 ${diffCm}cm 已落回型别「${fit.fit}」区间，常规档可覆盖，「${label}」标记可能不再必要，请确认是否取消`
+      )
+    }
+  }
+  return cautions
 }
 
 /** 重复行判定键：同名 + 同班级 + 同身高体重（规格书 §8） */
